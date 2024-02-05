@@ -81,6 +81,7 @@ func New(db *sql.DB, opts *Options) (*DB, error) {
 		upgrades:   make(map[int]string),
 		downgrades: make(map[int]string),
 		queryFS:    opts.QueryFS,
+		statements: make(map[string]*sql.Stmt),
 	}
 
 	// Load the Versioning map to prepare for upgrade.
@@ -139,7 +140,6 @@ func (db *DB) loadStatements() []error {
 		return []error{fmt.Errorf("could not read QueryFS: %w", err)}
 	}
 	var errs []error
-	db.statements = make(map[string]*sql.Stmt, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -278,6 +278,7 @@ func (db *DB) Named(name string) (*sql.Stmt, error) {
 		if err != nil {
 			return nil, fmt.Errorf("could not load statement '%s': %w", name, err)
 		}
+		s = db.statements[name]
 	}
 	return s, nil
 }
