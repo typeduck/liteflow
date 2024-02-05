@@ -10,15 +10,23 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"regexp"
+	"strconv"
 	"strings"
 )
 
 // DB is an enhanced SQLite *sql.DB with versioning and named statements.
 type DB struct {
 	*sql.DB
-	queryFS    fs.FS
-	versionFS  fs.FS
-	statements map[string]*sql.Stmt
+
+	// Versioning fields
+	versionFS  fs.FS          // filesystem of upgrade/downgrade filenames
+	upgrades   map[int]string // version => upgrade filename for version
+	downgrades map[int]string // version => downgrade filename from version
+
+	// Prepared statement fields
+	queryFS    fs.FS                // filesystem of all prepared statements
+	statements map[string]*sql.Stmt // statement cache
 }
 
 // UpgradeNone indicates to skip upgrading and prepared statements.
@@ -50,57 +58,98 @@ type Options struct {
 // defaultOptions are the default options used when no options are provided.
 var defaultOptions = Options{}
 
-// New creates DB, upgrading to given version and loading queries.
+// New creates DB, which is an enhanced *sql.DB with version control and named
+// prepared statements.
 //
-// A maxVersion of UpgradeNone will skip any database upgrades and
-// statement loading.
-//
-// A maxVersion of UpgradeAll will attempt to perform all upgrades from the
-// ./versions/ folder, in order.
+// See Options documentation for the available configurations.
 //
 // If the returned database is non-nil, it may still be usable even if there
-// were errors. This can occur if there are SQL errors in any of the versioning
-// scripts (./versions/) or statement scripts (./queries/).
-func New(driverName, dataSourceName string, opts *Options) (*DB, error) {
-	conn, err := sql.Open(driverName, dataSourceName)
-	if err != nil {
-		return nil, fmt.Errorf("could not open database: %w", err)
+// were errors.
+func New(db *sql.DB, opts *Options) (*DB, error) {
+	if db == nil {
+		return nil, fmt.Errorf("non-nil *sql.DB reference required")
 	}
-	// Set up options.
+
+	var errs []error // collect errors and join in the last step.
 	if opts == nil {
 		opts = &defaultOptions
 	}
 
-	d := &DB{DB: conn, versionFS: opts.VersionFS, queryFS: opts.QueryFS}
+	d := &DB{
+		DB:         db,
+		versionFS:  opts.VersionFS,
+		upgrades:   make(map[int]string),
+		downgrades: make(map[int]string),
+		queryFS:    opts.QueryFS,
+	}
 
-	// Upgrade datbase unless inhibited.
-	if opts.MaxVersion != UpgradeNone {
-		_, err = d.Upgrade(opts.MaxVersion)
+	// Load the Versioning map to prepare for upgrade.
+	if d.versionFS != nil {
+		errs = append(errs, d.loadVersions()...)
+	}
+
+	// Upgrade database unless inhibited.
+	if d.versionFS != nil && opts.MaxVersion != UpgradeNone {
+		_, err := d.Upgrade(opts.MaxVersion)
+		errs = append(errs, err)
 	}
 
 	// Preload Statements unless inhibited.
-	if !opts.NoPreload {
-		err = errors.Join(err, d.loadStatements())
+	if d.queryFS != nil && !opts.NoPreload {
+		loaderrs := d.loadStatements()
+		errs = append(errs, loaderrs...)
 	}
 
-	return d, err
+	return d, errors.Join(errs...)
+}
+
+// loadVersions initializes the map of the version numbers to the appropriate
+// upgrade & downgrade filenames.
+func (db *DB) loadVersions() []error {
+	entries, err := fs.ReadDir(db.versionFS, "/")
+	if err != nil {
+		return []error{fmt.Errorf("could not read versionFS: %w", err)}
+	}
+
+	rxVersion := regexp.MustCompile(`\d+`)
+	rxUpgrade := regexp.MustCompile(`\.up\.`)
+	rxDowngrade := regexp.MustCompile(`\.down\.`)
+
+	var errs []error
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		vnum, _ := strconv.Atoi(rxVersion.FindString(entry.Name()))
+		if vnum > 0 {
+			if rxUpgrade.MatchString(entry.Name()) {
+				db.upgrades[vnum] = entry.Name()
+			} else if rxDowngrade.MatchString(entry.Name()) {
+				db.downgrades[vnum] = entry.Name()
+			}
+		}
+	}
+	return errs
 }
 
 // loadStatements loads all the embedded prepared statements
-func (db *DB) loadStatements() error {
+func (db *DB) loadStatements() []error {
 	entries, err := fs.ReadDir(db.queryFS, "/")
 	if err != nil {
-		return fmt.Errorf("could not read queries: %w", err)
+		return []error{fmt.Errorf("could not read QueryFS: %w", err)}
 	}
-	var errs error
+	var errs []error
 	db.statements = make(map[string]*sql.Stmt, len(entries))
 	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
 		if !strings.HasSuffix(entry.Name(), ".sql") {
 			continue
 		}
 		name := strings.TrimSuffix(entry.Name(), ".sql")
 		if err := db.loadStatement(name); err != nil {
-			errs = errors.Join(errs, err)
+			errs = append(errs, err)
 		}
 	}
 	return errs
@@ -108,6 +157,9 @@ func (db *DB) loadStatements() error {
 
 // loadStatement loads a single named statement into the cache.
 func (db *DB) loadStatement(name string) error {
+	if db.queryFS == nil {
+		return fmt.Errorf("no QueryFS provided, cannot load statement '%s'", name)
+	}
 	f := name + ".sql"
 	b, err := fs.ReadFile(db.queryFS, f)
 	if err != nil {
@@ -145,7 +197,10 @@ func (db *DB) Upgrade(version int) (int, error) {
 			break
 		}
 		vNext := vCurr + 1
-		nextFileName := fmt.Sprintf("%d.up.sql", vNext)
+		nextFileName, ok := db.upgrades[vNext]
+		if !ok {
+			break
+		}
 		if err := db.runFileAndSetVersion(nextFileName, vNext); err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				return vCurr, nil
@@ -168,7 +223,10 @@ func (db *DB) Downgrade(version int) (int, error) {
 		if vCurr <= version {
 			break
 		}
-		nextFileName := fmt.Sprintf("%d.down.sql", vCurr)
+		nextFileName, ok := db.downgrades[vCurr]
+		if !ok {
+			break
+		}
 		if err := db.runFileAndSetVersion(nextFileName, vCurr-1); err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				return vCurr, nil
@@ -297,7 +355,9 @@ type Tx struct {
 	statements map[string]*sql.Stmt
 }
 
-// stmt gets the named statement scoped to the transaction.
+// Named creates a prepared statement for use within the transaction.
+//
+// The name must correspond to statements file.
 func (tx *Tx) Named(name string) (*sql.Stmt, error) {
 	s, ok := tx.statements[name]
 	if !ok {
