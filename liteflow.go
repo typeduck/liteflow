@@ -106,7 +106,7 @@ func New(db *sql.DB, opts *Options) (*DB, error) {
 // loadVersions initializes the map of the version numbers to the appropriate
 // upgrade & downgrade filenames.
 func (db *DB) loadVersions() []error {
-	entries, err := fs.ReadDir(db.versionFS, "/")
+	entries, err := fs.ReadDir(db.versionFS, ".")
 	if err != nil {
 		return []error{fmt.Errorf("could not read versionFS: %w", err)}
 	}
@@ -134,7 +134,7 @@ func (db *DB) loadVersions() []error {
 
 // loadStatements loads all the embedded prepared statements
 func (db *DB) loadStatements() []error {
-	entries, err := fs.ReadDir(db.queryFS, "/")
+	entries, err := fs.ReadDir(db.queryFS, ".")
 	if err != nil {
 		return []error{fmt.Errorf("could not read QueryFS: %w", err)}
 	}
