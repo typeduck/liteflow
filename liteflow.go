@@ -1,6 +1,9 @@
-// Package liteflow encourages keeping SQL statements in separate files. It is
-// used with an fs.FS (recommended: embed.FS) which keeps database migrations
-// and prepared statements in sub-folders.
+// Package liteflow encourages keeping SQL statements in separate files. Instead
+// of passing SQL and arguments, you pass a statement name and arguments. To
+// generate the named statements internally, pass an io/fs.FS (e.g.: embed.FS)
+// which contains the SQL files.
+//
+// This package can also handle database migrations for SQLite.
 package liteflow
 
 import (
@@ -173,10 +176,10 @@ func (db *DB) loadStatement(name string) error {
 	return nil
 }
 
-// Version returns the current database version according to the ./versions.
+// Version returns the current database version.
 func (db *DB) Version() (int, error) {
 	var vCurr int
-	row := db.QueryRow("PRAGMA user_version")
+	row := db.DB.QueryRow("PRAGMA user_version")
 	if err := row.Scan(&vCurr); err != nil {
 		return vCurr, fmt.Errorf("could not query user_version: %w", err)
 	}
@@ -270,7 +273,7 @@ func (db *DB) runFileAndSetVersion(filename string, version int) error {
 }
 
 // named returns the named statement.
-func (db *DB) Named(name string) (*sql.Stmt, error) {
+func (db *DB) named(name string) (*sql.Stmt, error) {
 	s, ok := db.statements[name]
 	if !ok {
 		var err error
@@ -283,60 +286,66 @@ func (db *DB) Named(name string) (*sql.Stmt, error) {
 	return s, nil
 }
 
-func (db *DB) NamedExec(name string, args ...any) (sql.Result, error) {
-	s, err := db.Named(name)
+// Exec is sql.DB.Exec but with a query name.
+func (db *DB) Exec(name string, args ...any) (sql.Result, error) {
+	s, err := db.named(name)
 	if err != nil {
 		return nil, err
 	}
 	return s.Exec(args...)
 }
 
-func (db *DB) NamedExecContext(ctx context.Context, name string, args ...any) (sql.Result, error) {
-	s, err := db.Named(name)
+// ExecContext is sql.DB.ExecContext but with a query name.
+func (db *DB) ExecContext(ctx context.Context, name string, args ...any) (sql.Result, error) {
+	s, err := db.named(name)
 	if err != nil {
 		return nil, err
 	}
 	return s.ExecContext(ctx, args...)
 }
 
-// NamedQuery executes a query that returns rows.
-func (db *DB) NamedQuery(name string, args ...any) (*sql.Rows, error) {
-	s, err := db.Named(name)
+// Query is sql.DB.Query but with a query name.
+func (db *DB) Query(name string, args ...any) (*sql.Rows, error) {
+	s, err := db.named(name)
 	if err != nil {
 		return nil, err
 	}
 	return s.Query(args...)
 }
 
-func (db *DB) NamedQueryContext(ctx context.Context, name string, args ...any) (*sql.Rows, error) {
-	s, err := db.Named(name)
+// QueryContext is sql.DB.QueryContext but with a query name.
+func (db *DB) QueryContext(ctx context.Context, name string, args ...any) (*sql.Rows, error) {
+	s, err := db.named(name)
 	if err != nil {
 		return nil, err
 	}
 	return s.QueryContext(ctx, args...)
 }
 
-func (db *DB) NamedQueryRow(name string, args ...any) (*sql.Row, error) {
-	s, err := db.Named(name)
+// QueryRow is sql.DB.QueryRow but with a query name.
+func (db *DB) QueryRow(name string, args ...any) (*sql.Row, error) {
+	s, err := db.named(name)
 	if err != nil {
 		return nil, err
 	}
 	return s.QueryRow(args...), nil
 }
 
-func (db *DB) NamedQueryRowContext(ctx context.Context, name string, args ...any) (*sql.Row, error) {
-	s, err := db.Named(name)
+// QueryRowContext is sql.DB.QueryRowContext but with a query name.
+func (db *DB) QueryRowContext(ctx context.Context, name string, args ...any) (*sql.Row, error) {
+	s, err := db.named(name)
 	if err != nil {
 		return nil, err
 	}
 	return s.QueryRowContext(ctx, args...), nil
 }
 
-// Tx starts a new transaction for data modifications.
+// Begin is like sql.DB.Begin, but returns a *liteflow.Tx for named queries.
 func (db *DB) Begin() (*Tx, error) {
 	return db.BeginTx(context.Background(), nil)
 }
 
+// BeginTx is like sql.DB.BeginTx, but returns a *liteflow.Tx for named queries.
 func (db *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
 	tx, err := db.DB.BeginTx(ctx, opts)
 	if err != nil {
@@ -349,21 +358,21 @@ func (db *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
 	}, nil
 }
 
-// Tx is required for all data access and modification.
+// Tx is like sql.Tx but uses named parameters.
 type Tx struct {
 	*sql.Tx
 	DB         *DB
 	statements map[string]*sql.Stmt
 }
 
-// Named creates a prepared statement for use within the transaction.
+// named creates a prepared statement for use within the transaction.
 //
 // The name must correspond to statements file.
-func (tx *Tx) Named(name string) (*sql.Stmt, error) {
+func (tx *Tx) named(name string) (*sql.Stmt, error) {
 	s, ok := tx.statements[name]
 	if !ok {
 		var err error
-		if s, err = tx.DB.Named(name); err != nil {
+		if s, err = tx.DB.named(name); err != nil {
 			return nil, err
 		}
 		s = tx.Stmt(s)
@@ -372,48 +381,54 @@ func (tx *Tx) Named(name string) (*sql.Stmt, error) {
 	return s, nil
 }
 
-func (tx *Tx) NamedExec(name string, args ...any) (sql.Result, error) {
-	s, err := tx.Named(name)
+// Exec is like sql.Tx.Exec but with a query name.
+func (tx *Tx) Exec(name string, args ...any) (sql.Result, error) {
+	s, err := tx.named(name)
 	if err != nil {
 		return nil, err
 	}
 	return s.Exec(args...)
 }
 
-func (tx *Tx) NamedExecContext(ctx context.Context, name string, args ...any) (sql.Result, error) {
-	s, err := tx.Named(name)
+// ExecContext is like sql.Tx.ExecContext but with a query name.
+func (tx *Tx) ExecContext(ctx context.Context, name string, args ...any) (sql.Result, error) {
+	s, err := tx.named(name)
 	if err != nil {
 		return nil, err
 	}
 	return s.ExecContext(ctx, args...)
 }
 
-func (tx *Tx) NamedQuery(name string, args ...any) (*sql.Rows, error) {
-	s, err := tx.Named(name)
+// Query is like sql.Tx.Query but with a query name.
+func (tx *Tx) Query(name string, args ...any) (*sql.Rows, error) {
+	s, err := tx.named(name)
 	if err != nil {
 		return nil, err
 	}
 	return s.Query(args...)
 }
 
-func (tx *Tx) NamedQueryContext(ctx context.Context, name string, args ...any) (*sql.Rows, error) {
-	s, err := tx.Named(name)
+// QueryContext is like sql.Tx.QueryContext but with a query name.
+func (tx *Tx) QueryContext(ctx context.Context, name string, args ...any) (*sql.Rows, error) {
+	s, err := tx.named(name)
 	if err != nil {
 		return nil, err
 	}
 	return s.QueryContext(ctx, args...)
 }
 
-func (tx *Tx) NamedQueryRow(name string, args ...any) (*sql.Row, error) {
-	s, err := tx.Named(name)
+// QueryRow is like sql.Tx.QueryRow but with a query name.
+func (tx *Tx) QueryRow(name string, args ...any) (*sql.Row, error) {
+	s, err := tx.named(name)
 	if err != nil {
 		return nil, err
 	}
 	return s.QueryRow(args...), nil
 }
 
-func (tx *Tx) NamedQueryRowContext(ctx context.Context, name string, args ...any) (*sql.Row, error) {
-	s, err := tx.Named(name)
+// QueryRowContext is like sql.Tx.QueryRowContext but with a query name.
+func (tx *Tx) QueryRowContext(ctx context.Context, name string, args ...any) (*sql.Row, error) {
+	s, err := tx.named(name)
 	if err != nil {
 		return nil, err
 	}
