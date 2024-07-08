@@ -7,6 +7,7 @@
 package liteflow
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"errors"
@@ -100,7 +101,7 @@ func New(db *sql.DB, opts *Options) (*DB, error) {
 
 	// Preload Statements unless inhibited.
 	if d.queryFS != nil && !opts.NoPreload {
-		loaderrs := d.loadStatements()
+		loaderrs := d.loadAllStatements()
 		errs = append(errs, loaderrs...)
 	}
 
@@ -136,8 +137,8 @@ func (db *DB) loadVersions() []error {
 	return errs
 }
 
-// loadStatements loads all the embedded prepared statements
-func (db *DB) loadStatements() []error {
+// loadAllStatements loads all the embedded prepared statements
+func (db *DB) loadAllStatements() []error {
 	entries, err := fs.ReadDir(db.queryFS, ".")
 	if err != nil {
 		return []error{fmt.Errorf("could not read QueryFS: %w", err)}
@@ -151,28 +152,76 @@ func (db *DB) loadStatements() []error {
 			continue
 		}
 		name := strings.TrimSuffix(entry.Name(), ".sql")
-		if err := db.loadStatement(name); err != nil {
+		if err := db.loadStatements(name); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return errs
 }
 
-// loadStatement loads a single named statement into the cache.
-func (db *DB) loadStatement(name string) error {
+var rxNameline = regexp.MustCompile(`(?i)^--\s*name:\s*(\S+)`)
+var rxComment = regexp.MustCompile(`^--`)
+
+// loadStatements loads a single SQL file's named statement into the cache.
+func (db *DB) loadStatements(name string) error {
 	if db.queryFS == nil {
 		return fmt.Errorf("no QueryFS provided, cannot load statement '%s'", name)
 	}
-	f := name + ".sql"
-	b, err := fs.ReadFile(db.queryFS, f)
+	// TODO: fix lazy-loading when statement is named in comment.
+	fn := name + ".sql"
+	f, err := db.queryFS.Open(fn)
 	if err != nil {
-		return fmt.Errorf("could not read file '%s': %w", f, err)
+		return fmt.Errorf("could not open file '%s': %w", fn, err)
 	}
-	s, err := db.DB.Prepare(string(b))
-	if err != nil {
-		return fmt.Errorf("could not prepare '%s': %w", name, err)
+	s := bufio.NewScanner(f)
+	subname := ""
+	lines := make([]string, 0, 20)
+	lno := 0
+	for s.Scan() {
+		line := strings.TrimSpace(s.Text())
+		if len(line) == 0 {
+			continue
+		}
+		lno++
+		if rxNameline.MatchString(line) {// found named query
+			// prepare any buffered lines into current statement.
+			if len(lines) > 0 {
+				joined := strings.Join(lines, "\n")
+				queryName := name
+				if subname != "" {
+					queryName += "." + subname
+				}
+				s, err := db.DB.Prepare(joined)
+				if err != nil {
+					return fmt.Errorf("[%s:%d] could not prepare '%s': %w", fn, lno, queryName, err)
+				}
+				db.statements[queryName] = s
+			}
+			// extract the new subname for the following lines / reset buffer
+			parts := rxNameline.FindStringSubmatch(line)
+			subname = parts[1]
+			lines = lines[:0]
+		} else if !rxComment.MatchString(line) {
+			lines = append(lines, line)
+		}
 	}
-	db.statements[name] = s
+	if s.Err() != nil {
+		return fmt.Errorf("could not scan %s (reached line %d): %w", fn, lno, s.Err())
+	}
+	// If lines left over (e.g. no named queries), then prepare query now.
+	if len(lines) > 0 {
+		joined := strings.Join(lines, "\n")
+		queryName := name
+		if subname != "" {
+			queryName += "." + subname
+		}
+		s, err := db.DB.Prepare(joined)
+		if err != nil {
+			return fmt.Errorf("[%s:%d] could not prepare '%s': %w", fn, lno, queryName, err)
+		}
+		db.statements[queryName] = s
+
+	}
 	return nil
 }
 
@@ -277,7 +326,7 @@ func (db *DB) named(name string) (*sql.Stmt, error) {
 	s, ok := db.statements[name]
 	if !ok {
 		var err error
-		err = db.loadStatement(name)
+		err = db.loadStatements(name)
 		if err != nil {
 			return nil, fmt.Errorf("could not load statement '%s': %w", name, err)
 		}
