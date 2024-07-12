@@ -28,6 +28,9 @@ type DB struct {
 	upgrades   map[int]string // version => upgrade filename for version
 	downgrades map[int]string // version => downgrade filename from version
 
+	// Initializations after versioning
+	initFS fs.FS
+
 	// Prepared statement fields
 	queryFS    fs.FS                // filesystem of all prepared statements
 	statements map[string]*sql.Stmt // statement cache
@@ -53,6 +56,10 @@ type Options struct {
 	// VersionFS is the sub-directory in the fs.FS which holds the numbered
 	// database migration files.
 	VersionFS fs.FS
+
+	// InitFS is the filesystem holding initialization scripts, run in file
+	// lexical sort order.
+	InitFS fs.FS
 
 	// QueryFS is the sub-directory in the fs.FS which holds all prepared
 	// statements.
@@ -84,6 +91,7 @@ func New(db *sql.DB, opts *Options) (*DB, error) {
 		versionFS:  opts.VersionFS,
 		upgrades:   make(map[int]string),
 		downgrades: make(map[int]string),
+		initFS:     opts.InitFS,
 		queryFS:    opts.QueryFS,
 		statements: make(map[string]*sql.Stmt),
 	}
@@ -97,6 +105,11 @@ func New(db *sql.DB, opts *Options) (*DB, error) {
 	if d.versionFS != nil && opts.MaxVersion != UpgradeNone {
 		_, err := d.Upgrade(opts.MaxVersion)
 		errs = append(errs, err)
+	}
+
+	// Run any initialization scripts.
+	if d.initFS != nil && !opts.NoPreload {
+		errs = append(errs, d.runInitScripts()...)
 	}
 
 	// Preload Statements unless inhibited.
@@ -135,6 +148,52 @@ func (db *DB) loadVersions() []error {
 		}
 	}
 	return errs
+}
+
+// runInitScripts runs any SQL-based start initializations prior to loading
+// statements.
+func (db *DB) runInitScripts() []error {
+	entries, err := fs.ReadDir(db.initFS, ".")
+	if err != nil {
+		return []error{fmt.Errorf("could not read InitFS: %w", err)}
+	}
+	var errs []error
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if !strings.HasSuffix(entry.Name(), ".sql") {
+			continue
+		}
+		if err := db.runOneScript(entry.Name()); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errs
+}
+
+// runOneScript runs a single initialization script
+func (db *DB) runOneScript(filename string) error {
+	f, err := db.initFS.Open(filename)
+	if err != nil {
+		return fmt.Errorf("could not open SQL init file '%s': %w", filename, err)
+	}
+	content, err := io.ReadAll(f)
+	if err != nil {
+		return fmt.Errorf("could not read SQL init file '%s': %w", filename, err)
+	}
+	tx, err := db.DB.Begin()
+	if err != nil {
+		return fmt.Errorf("could not start tx for init file '%s': %w", filename, err)
+	}
+	if _, err := tx.Exec(string(content)); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("could not run SQL init file '%s' (rolled back): %w", filename, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("could not commit for init file '%s': %w", filename, err)
+	}
+	return nil
 }
 
 // loadAllStatements loads all the embedded prepared statements
@@ -183,7 +242,7 @@ func (db *DB) loadStatements(name string) error {
 			continue
 		}
 		lno++
-		if rxNameline.MatchString(line) {// found named query
+		if rxNameline.MatchString(line) { // found named query
 			// prepare any buffered lines into current statement.
 			if len(lines) > 0 {
 				joined := strings.Join(lines, "\n")
